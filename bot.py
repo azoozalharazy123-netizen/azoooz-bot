@@ -5,6 +5,23 @@ from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from ebooklib import epub
+from flask import Flask
+from threading import Thread
+
+# --- سيرفر وهمي لتجاوز فحص المنفذ (Port) في Render المجاني ---
+web_app = Flask('')
+
+@web_app.route('/')
+def home():
+    return "Bot is active 24/7!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    web_app.run(host='0.0.0.0', port=port)
+
+# تشغيل سيرفر الويب في مسار مستقل (Thread) قبل البوت
+Thread(target=run_flask).start()
+# -------------------------------------------------------------
 
 # التوكين الخاص بك
 BOT_TOKEN = "8894093871:AAF85mlx2QDVjjAv-oafaYUsoaSGCPPc7NQ"
@@ -98,3 +115,4 @@ if __name__ == "__main__":
     
     print("البوت يعمل الآن...")
     app.run_polling()
+ 
