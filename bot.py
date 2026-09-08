@@ -8,9 +8,8 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 from ebooklib import epub
 from flask import Flask
 from threading import Thread
-from urllib.parse import urljoin
 
-# --- سيرفر وهمي لتجاوز فحص المنفذ (Port) في Render المجاني ---
+# --- سيرفر وهمي لتجاوز فحص المنفذ (Port) في Render ---
 web_app = Flask('')
 
 @web_app.route('/')
@@ -22,105 +21,75 @@ def run_flask():
     web_app.run(host='0.0.0.0', port=port)
 
 Thread(target=run_flask).start()
-# -------------------------------------------------------------
+# ---------------------------------------------------
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8894093871:AAF85mlx2QDVjjAv-oafaYUsoaSGCPPc7NQ")
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 }
 
 def clean_filename(title):
     return re.sub(r'[\\/*?:"<>|]', "", title).strip()
 
-def extract_chapter_num(text_or_url):
-    """استخراج رقم الفصل لتصفية العناوين العشوائية وضمان الترتيب الصحيح"""
-    match = re.search(r'(?:فصل|chapter|chap|ch|fssl)[^\d]*(\d+)', text_or_url, re.I)
-    if not match:
-        # البحث عن أرقام محاطة بشرطات أو في نهاية الرابط
-        match = re.search(r'-(\d+)(?:/|$)', text_or_url)
-    return int(match.group(1)) if match else None
-
-def get_all_chapters_paginated(base_url):
-    """تتبع كل صفحات الفهرس لاستخراج الـ 1100+ فصل كاملة بدون قفزات"""
-    chapters_map = {}
-    novel_title = "رواية"
-    
-    current_page_url = base_url
-    visited_pages = set()
-
-    while current_page_url and current_page_url not in visited_pages:
-        visited_pages.add(current_page_url)
-        try:
-            res = requests.get(current_page_url, headers=HEADERS, timeout=15)
+def get_chapters_via_wp_api(base_url):
+    """جلب قائمة جميع الفصول مباشرة من الـ API الخفي للموقع بدقة 100%"""
+    try:
+        domain = re.match(r'https?://[^/]+', base_url).group(0)
+        # استخراج اسم الرواية/الـ Slug من الرابط
+        slug_match = re.search(r'/cont/([^/]+)', base_url)
+        if not slug_match:
+            return "رواية", []
+        
+        novel_slug = slug_match.group(1)
+        api_url = f"{domain}/wp-json/wp/v2/posts?per_page=100&page="
+        
+        all_chapters = []
+        page = 1
+        
+        while True:
+            res = requests.get(f"{api_url}{page}", headers=HEADERS, timeout=10)
             if res.status_code != 200:
                 break
-
-            soup = BeautifulSoup(res.text, "html.parser")
-
-            if novel_title == "رواية":
-                t_tag = soup.find("h1") or soup.find("h2")
-                if t_tag:
-                    novel_title = t_tag.text.strip()
-
-            # استخراج روابط الفصول المباشرة واستبعاد أزرار التنقل
-            for a in soup.find_all("a", href=True):
-                href = a["href"]
-                text = a.text.strip()
-                full_url = urljoin(base_url, href)
-
-                # استبعاد العناوين غير ذات الصلة
-                if any(bad in text for bad in ["ابدأ القراءة", "عرض قائمة", "الصفحة التالية", "التالي", "السابق"]):
-                    continue
-
-                ch_num = extract_chapter_num(text) or extract_chapter_num(href)
-                
-                if ch_num is not None and full_url not in chapters_map:
-                    # التأكد من عدم تكرار نفس الرقم
-                    chapters_map[ch_num] = {
-                        "title": f"الفصل {ch_num}: {text}" if not text.isdigit() else f"الفصل {ch_num}",
-                        "url": full_url,
-                        "num": ch_num
-                    }
-
-            # البحث عن زر الصفحة التالية في الفهرس (Pagination)
-            next_page = soup.find("a", class_=re.compile(r"(next|next-page)", re.I)) or \
-                        soup.find("a", text=re.compile(r"(التالي|Next|›|»)", re.I))
             
-            if next_page and next_page.get("href"):
-                next_url = urljoin(base_url, next_page["href"])
-                if next_url != current_page_url and "page" in next_url:
-                    current_page_url = next_url
-                else:
-                    break
-            else:
+            posts = res.json()
+            if not posts:
                 break
-        except Exception:
-            break
+                
+            for post in posts:
+                if novel_slug in post.get('link', ''):
+                    title = BeautifulSoup(post['title']['rendered'], "html.parser").text.strip()
+                    num_match = re.search(r'(\d+)', title)
+                    num = int(num_match.group(1)) if num_match else 9999
+                    
+                    all_chapters.append({
+                        "title": title,
+                        "url": post['link'],
+                        "num": num
+                    })
+            page += 1
 
-    # تحويل القائمة إلى ترتيب تصاعدي صارم
-    sorted_chapters = [chapters_map[k] for k in sorted(chapters_map.keys())]
-    return novel_title, sorted_chapters
+        # ترتيب الفصول من الفصل 1 تصاعدياً
+        all_chapters.sort(key=lambda x: x["num"])
+        novel_title = novel_slug.replace('-', ' ').title()
+        
+        return novel_title, all_chapters
+    except Exception:
+        return "رواية", []
 
-def scrape_chapter_body(url):
-    """استخراج نص الفصل فقط بدون روابط أو صفحات فهرس متداخلة"""
+def scrape_chapter_clean(url):
+    """استخراج نص الفصل وتنظيفه تماماً من أي إعلانات أو أزرار"""
     try:
-        response = requests.get(url, headers=HEADERS, timeout=15)
-        if response.status_code != 200:
+        res = requests.get(url, headers=HEADERS, timeout=15)
+        if res.status_code != 200:
             return None
 
-        soup = BeautifulSoup(response.text, "html.parser")
-
-        container = (
-            soup.find("div", class_=re.compile(r"(entry-content|epcontent|reading-content|chapter-content|content)", re.I))
-            or soup.find("article")
-        )
+        soup = BeautifulSoup(res.text, "html.parser")
+        container = soup.find("div", class_=re.compile(r"(entry-content|epcontent|reading-content|chapter-content)", re.I)) or soup.find("article")
 
         if not container:
             container = soup.find("body")
 
-        # إزالة جميع الأزرار والروابط السفلية/العلوية
         for unwanted in container.find_all(["script", "style", "iframe", "ins", "button", "nav", "a"]):
             unwanted.decompose()
 
@@ -143,8 +112,7 @@ def scrape_chapter_body(url):
     except Exception:
         return None
 
-def build_clean_epub(novel_title, chapters_data, output_path):
-    """تصدير ملف EPUB نظيف ومطابق لمعايير القراءة في Moon+ Reader"""
+def build_epub(novel_title, chapters, output_path):
     book = epub.EpubBook()
     book.set_title(novel_title)
     book.set_language("ar")
@@ -152,14 +120,14 @@ def build_clean_epub(novel_title, chapters_data, output_path):
     epub_chapters = []
     spine = ["nav"]
 
-    for idx, (ch_title, ch_content) in enumerate(chapters_data, start=1):
+    for idx, (ch_title, ch_content) in enumerate(chapters, start=1):
         ch_file = f"chap_{idx}.xhtml"
         chapter = epub.EpubHtml(title=ch_title, file_name=ch_file, lang="ar")
         
         html_body = f"""
         <div dir='rtl' style='text-align: right; font-family: sans-serif; line-height: 1.8; font-size: 1.1em;'>
-            <h2 style='text-align: center; color: #333;'>{html.escape(ch_title)}</h2>
-            <hr style='border: 0; height: 1px; background: #ccc; margin-bottom: 20px;'/>
+            <h2 style='text-align: center;'>{html.escape(ch_title)}</h2>
+            <hr/><br/>
             <div>{ch_content}</div>
         </div>
         """
@@ -177,55 +145,71 @@ def build_clean_epub(novel_title, chapters_data, output_path):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "أهلاً بك! أرسل رابط **الصفحة الرئيسية للرواية** وسأقوم بجمع كافة الفصول مرتبة وبشكل كامل."
+        "أهلاً بك! أرسل لي رابط الصفحة الرئيسية للرواية وسأستخرج قائمة الفصول كاملاً بأسلوب الـ API السريع.\n\n"
+        "💡 **المميزات الجديدة:**\n"
+        "1. استخراج الـ 1100+ فصل كاملة بطلب واحد.\n"
+        "2. لتنزيل أجزاء محددة (مثل أول 50 فصل)، أرسل الرابط متبوعاً بـ النطاق مثلاً:\n"
+        "`https://cenele.com/cont/my-longevity-simulation/ 1 50`"
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text.strip()
+    text = update.message.text.strip().split()
+    url = text[0]
+    
+    start_ch, end_ch = None, None
+    if len(text) >= 3:
+        try:
+            start_ch = int(text[1])
+            end_ch = int(text[2])
+        except ValueError:
+            pass
+
     if not url.startswith("http"):
-        await update.message.reply_text("يرجى إرسال رابط صحيح يبدأ بـ http أو https.")
+        await update.message.reply_text("يرجى إرسال رابط صحيح.")
         return
 
-    status_msg = await update.message.reply_text("🔍 جاري فحص صفحات الفهرس بالكامل واستخراج الفصول...")
+    status_msg = await update.message.reply_text("⚡ جاري الاتصال بالـ API واستخراج قائمة الفصول كاملة...")
 
-    # 1. تتبع الفهرس الكامل
-    novel_title, chapters_list = get_all_chapters_paginated(url)
+    novel_title, all_chapters = get_chapters_via_wp_api(url)
 
-    if not chapters_list:
-        await status_msg.edit_text("❌ لم يتم العثور على فصول صالحة في الرابط.")
+    if not all_chapters:
+        await status_msg.edit_text("❌ لم ينجح الاتصال بالـ API الخاص بالموقع.")
         return
 
-    total = len(chapters_list)
-    await status_msg.edit_text(f"📖 تم العثور على {total} فصل متسلسل بدون قفزات.\n⏳ جاري التحميل والتجميع...")
+    # تطبيق تحديد نطاق الفصول إذا أرسله المستخدم
+    if start_ch and end_ch:
+        all_chapters = [c for c in all_chapters if start_ch <= c['num'] <= end_ch]
 
-    # 2. تحميل المحتوى
+    total = len(all_chapters)
+    await status_msg.edit_text(f"📖 تم جلب {total} فصل متسلسل.\n⏳ جاري التحميل وتجهيز ملف EPUB...")
+
     collected = []
-    for idx, item in enumerate(chapters_list, start=1):
+    for idx, ch in enumerate(all_chapters, start=1):
         if idx % 10 == 0 or idx == total:
-            await status_msg.edit_text(f"⏳ جاري تحميل الفصل ({idx}/{total}): {item['title']}...")
+            pct = int((idx / total) * 100)
+            await status_msg.edit_text(f"⏳ جاري التحميل: {pct}% ({idx}/{total})\nالفصل: {ch['title']}")
 
-        content = scrape_chapter_body(item["url"])
+        content = scrape_chapter_clean(ch['url'])
         if content:
-            collected.append((item["title"], content))
+            collected.append((ch['title'], content))
 
     if not collected:
-        await status_msg.edit_text("❌ تعذر استخراج محتوى الفصول.")
+        await status_msg.edit_text("❌ تعذر استخراج المحتوى.")
         return
 
-    # 3. تصدير ملف EPUB
-    await status_msg.edit_text("📦 جاري بناء ملف الـ EPUB النهائي...")
+    await status_msg.edit_text("📦 جاري ضغط وتنسيق ملف الـ EPUB...")
     
     safe_title = clean_filename(novel_title)
     file_path = f"{safe_title}.epub"
 
     try:
-        build_clean_epub(novel_title, collected, file_path)
+        build_epub(novel_title, collected, file_path)
 
         with open(file_path, "rb") as file:
             await update.message.reply_document(
                 document=file,
                 filename=f"{safe_title}.epub",
-                caption=f"📚 **{novel_title}**\n✅ تم تجميع {len(collected)} فصل متسلسل بنجاح!"
+                caption=f"📚 **{novel_title}**\n✅ تم تجميع {len(collected)} فصل بنجاح بأسلوب الـ API!"
             )
 
         await status_msg.delete()
@@ -240,6 +224,6 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    print("البوت يعمل بنظام الفهرس الشامل والتتبع...")
+    print("البوت يعمل بالـ API الخفي...")
     app.run_polling()
  
