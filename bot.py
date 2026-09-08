@@ -8,8 +8,9 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 from ebooklib import epub
 from flask import Flask
 from threading import Thread
+from urllib.parse import urljoin
 
-# --- سيرفر وهمي لمنع توقف Render ---
+# --- سيرفر وهمي لتجاوز فحص المنفذ (Port) في Render المجاني ---
 web_app = Flask('')
 
 @web_app.route('/')
@@ -21,32 +22,64 @@ def run_flask():
     web_app.run(host='0.0.0.0', port=port)
 
 Thread(target=run_flask).start()
-# ------------------------------------
+# -------------------------------------------------------------
 
-BOT_TOKEN = "8894093871:AAF85mlx2QDVjjAv-oafaYUsoaSGCPPc7NQ"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8894093871:AAF85mlx2QDVjjAv-oafaYUsoaSGCPPc7NQ")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "ar,en-US;q=0.7,en;q=0.3",
 }
 
 def clean_filename(title):
     return re.sub(r'[\\/*?:"<>|]', "", title).strip()
 
-def scrape_chapter_content(url):
+def extract_chapters_from_index(main_url):
+    """استخراج عنوان الرواية ورابط جميع الفصول من الصفحة الرئيسية"""
     try:
-        response = requests.get(url, headers=HEADERS, timeout=20)
+        response = requests.get(main_url, headers=HEADERS, timeout=20)
         if response.status_code != 200:
-            return None, None
+            return None, []
 
         soup = BeautifulSoup(response.text, "html.parser")
 
-        # عنوان الفصل
-        title_tag = soup.find("h1") or soup.find("h2") or soup.find("title")
-        ch_title = title_tag.text.strip() if title_tag else "فصل رواية"
+        # 1. استخراج اسم الرواية
+        novel_title_tag = soup.find("h1") or soup.find("h2")
+        novel_title = novel_title_tag.text.strip() if novel_title_tag else "رواية"
 
-        # تحديد الحاوية النصية الخاصة بـ cenele والمواقع المشابهة
+        # 2. البحث عن الحاوية المسؤولة عن قائمة الفصول (Chapter List / Table of Contents)
+        chapter_links = []
+        
+        # استهداف الحاويات الشائعة لفهارس الفصول في مواقع الروايات
+        toc_container = (
+            soup.find("div", class_=re.compile(r"(chapter-list|eplist|chapters|index|table-of-contents)", re.I))
+            or soup.find("ul", class_=re.compile(r"(chapter-list|eplist|chapters)", re.I))
+            or soup
+        )
+
+        for a_tag in toc_container.find_all("a", href=True):
+            href = a_tag["href"]
+            text = a_tag.text.strip()
+            
+            # فلترة الروابط للتأكد من أنها روابط فصولوليست روابط أقسام أو صفحات أخرى
+            if re.search(r'(chapter|fssl|فصل|\d+)', href, re.I) or re.search(r'(فصل|Chapter)', text, re.I):
+                full_url = urljoin(main_url, href)
+                if full_url not in [c['url'] for c in chapter_links]:
+                    chapter_links.append({"title": text or "فصل", "url": full_url})
+
+        return novel_title, chapter_links
+    except Exception:
+        return None, []
+
+def scrape_single_chapter(url):
+    """كشط وتنظيف نص الفصل الواحد"""
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=15)
+        if response.status_code != 200:
+            return None
+
+        soup = BeautifulSoup(response.text, "html.parser")
+
         container = (
             soup.find("div", class_=re.compile(r"(entry-content|epcontent|reading-content|chapter-content|content)", re.I))
             or soup.find("article")
@@ -55,8 +88,8 @@ def scrape_chapter_content(url):
         if not container:
             container = soup.find("body")
 
-        # تنظيف الإعلانات والروابط الشائبة
-        for unwanted in container.find_all(["script", "style", "iframe", "ins", "button"]):
+        # إزالة العناصر غير المرغوبة (إعلانات، أزرار، نصوص سفلية)
+        for unwanted in container.find_all(["script", "style", "iframe", "ins", "button", "nav"]):
             unwanted.decompose()
 
         paragraphs = container.find_all("p")
@@ -74,37 +107,46 @@ def scrape_chapter_content(url):
                 if txt and len(txt) > 5:
                     text_list.append(html.escape(txt))
 
-        content_text = "<br/><br/>".join(text_list)
-        return ch_title, content_text
-
+        return "<br/><br/>".join(text_list)
     except Exception:
-        return None, None
+        return None
 
-def create_epub_file(title, content, filename):
+def build_full_epub(novel_title, chapters_data, output_path):
+    """تجميع الفصول في ملف EPUB واحد مع جدول محتويات متكامل"""
     book = epub.EpubBook()
-    book.set_title(title)
+    book.set_title(novel_title)
     book.set_language("ar")
 
-    chapter = epub.EpubHtml(title=title, file_name="chap_1.xhtml", lang="ar")
-    
-    html_body = f"""
-    <div dir='rtl' style='text-align: right; font-family: sans-serif; line-height: 1.6;'>
-        <h2 style='text-align: center;'>{html.escape(title)}</h2>
-        <hr/><br/>
-        <div>{content}</div>
-    </div>
-    """
-    chapter.content = html_body
-    book.add_item(chapter)
-    book.toc = (chapter,)
+    epub_chapters = []
+    spine = ["nav"]
+
+    for idx, (ch_title, ch_content) in enumerate(chapters_data, start=1):
+        ch_file = f"chap_{idx}.xhtml"
+        chapter = epub.EpubHtml(title=ch_title, file_name=ch_file, lang="ar")
+        
+        html_body = f"""
+        <div dir='rtl' style='text-align: right; font-family: sans-serif; line-height: 1.6;'>
+            <h2 style='text-align: center;'>{html.escape(ch_title)}</h2>
+            <hr/><br/>
+            <div>{ch_content}</div>
+        </div>
+        """
+        chapter.content = html_body
+        book.add_item(chapter)
+        epub_chapters.append(chapter)
+        spine.append(chapter)
+
+    book.toc = tuple(epub_chapters)
     book.add_item(epub.EpubNcx())
     book.add_item(epub.EpubNav())
-    book.spine = ["nav", chapter]
+    book.spine = spine
 
-    epub.write_epub(filename, book)
+    epub.write_epub(output_path, book)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("أهلاً بك! أرسل لي رابط الفصل وسأستخرج لك النص في ملف EPUB جاهز.")
+    await update.message.reply_text(
+        "أهلاً بك! أرسل رابط **الصفحة الرئيسية للرواية** (صفحة الفهرس/قائمة الفصول) وسأقوم بسحب جميع الفصول وتجميعها في ملف EPUB واحد تماماً مثل WebToEpub."
+    )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
@@ -112,24 +154,47 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("يرجى إرسال رابط صحيح يبدأ بـ http أو https.")
         return
 
-    status_msg = await update.message.reply_text("⏳ جاري جلب محتوى الفصل...")
+    status_msg = await update.message.reply_text("🔍 جاري قراءة فهرس الرواية واستخراج قائمة الفصول...")
+
+    # 1. جلب قائمة الفصول
+    novel_title, chapters_list = extract_chapters_from_index(url)
+
+    if not chapters_list:
+        await status_msg.edit_text("❌ لم يتم العثور على قائمة الفصول في هذا الرابط. تأكد من إرسال رابط الصفحة الرئيسية للرواية.")
+        return
+
+    total_chapters = len(chapters_list)
+    await status_msg.edit_text(f"📖 تم العثور على {total_chapters} فصل/فصول في «{novel_title}».\n⏳ جاري تحميل وتحويل الفصول...")
+
+    # 2. كشط محتوى كل فصل بالتتابع
+    collected_chapters = []
+    for idx, item in enumerate(chapters_list, start=1):
+        # تحديث الرسالة كل 5 فصول لإظهار التقدم للمستخدم
+        if idx % 5 == 0 or idx == total_chapters:
+            await status_msg.edit_text(f"⏳ جاري معالجة الفصل ({idx}/{total_chapters})...")
+
+        content = scrape_single_chapter(item["url"])
+        if content:
+            collected_chapters.append((item["title"], content))
+
+    if not collected_chapters:
+        await status_msg.edit_text("❌ تعذر استخراج محتوى الفصول. قد تكون الصفحة محصنة أو مغلقة.")
+        return
+
+    # 3. بناء ملف EPUB
+    await status_msg.edit_text("📦 جاري تجميع الرواية وإنشاء ملف الـ EPUB...")
+    
+    safe_title = clean_filename(novel_title)
+    file_path = f"{safe_title}.epub"
 
     try:
-        title, content = scrape_chapter_content(url)
-        if not content:
-            await status_msg.edit_text("❌ تعذر جلب محتوى الفصل. قد يكون الرابط خاطئاً أو الموقع يحظر الاتصال.")
-            return
-
-        safe_title = clean_filename(title)
-        file_path = f"{safe_title}.epub"
-        
-        create_epub_file(title, content, file_path)
+        build_full_epub(novel_title, collected_chapters, file_path)
 
         with open(file_path, "rb") as file:
             await update.message.reply_document(
-                document=file, 
+                document=file,
                 filename=f"{safe_title}.epub",
-                caption=f"📚 تم تحويل الفصل بنجاح: {title}"
+                caption=f"📚 **{novel_title}**\n✅ تم تجميع {len(collected_chapters)} فصل بنجاح!"
             )
 
         await status_msg.delete()
@@ -137,12 +202,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             os.remove(file_path)
 
     except Exception as e:
-        await status_msg.edit_text(f"حدث خطأ أثناء المعالجة: {str(e)}")
+        await status_msg.edit_text(f"حدث خطأ أثناء التجميع: {str(e)}")
 
 if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    print("البوت يعمل الآن...")
+    print("البوت يعمل بأسلوب WebToEpub...")
     app.run_polling()
+ 
