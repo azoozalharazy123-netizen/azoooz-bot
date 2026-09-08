@@ -3,4 +3,5 @@ requests
 beautifulsoup4
 EbookLib
 Flask
-
+playwright
+asyncio
