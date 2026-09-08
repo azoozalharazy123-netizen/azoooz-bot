@@ -8,6 +8,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 from ebooklib import epub
 from flask import Flask
 from threading import Thread
+from urllib.parse import urljoin
 
 # --- سيرفر وهمي لتجاوز فحص المنفذ (Port) في Render ---
 web_app = Flask('')
@@ -26,70 +27,71 @@ Thread(target=run_flask).start()
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8894093871:AAF85mlx2QDVjjAv-oafaYUsoaSGCPPc7NQ")
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
 }
 
 def clean_filename(title):
     return re.sub(r'[\\/*?:"<>|]', "", title).strip()
 
-def get_chapters_via_wp_api(base_url):
-    """جلب قائمة جميع الفصول مباشرة من الـ API الخفي للموقع بدقة 100%"""
+def get_all_chapters_direct(main_url):
+    """سحب جميع الفصول من الفهرس وتنظيف العناوين والترتيب المباشر"""
     try:
-        domain = re.match(r'https?://[^/]+', base_url).group(0)
-        # استخراج اسم الرواية/الـ Slug من الرابط
-        slug_match = re.search(r'/cont/([^/]+)', base_url)
-        if not slug_match:
+        res = requests.get(main_url, headers=HEADERS, timeout=20)
+        if res.status_code != 200:
             return "رواية", []
-        
-        novel_slug = slug_match.group(1)
-        api_url = f"{domain}/wp-json/wp/v2/posts?per_page=100&page="
-        
-        all_chapters = []
-        page = 1
-        
-        while True:
-            res = requests.get(f"{api_url}{page}", headers=HEADERS, timeout=10)
-            if res.status_code != 200:
-                break
-            
-            posts = res.json()
-            if not posts:
-                break
-                
-            for post in posts:
-                if novel_slug in post.get('link', ''):
-                    title = BeautifulSoup(post['title']['rendered'], "html.parser").text.strip()
-                    num_match = re.search(r'(\d+)', title)
-                    num = int(num_match.group(1)) if num_match else 9999
-                    
-                    all_chapters.append({
-                        "title": title,
-                        "url": post['link'],
-                        "num": num
-                    })
-            page += 1
 
-        # ترتيب الفصول من الفصل 1 تصاعدياً
-        all_chapters.sort(key=lambda x: x["num"])
-        novel_title = novel_slug.replace('-', ' ').title()
-        
-        return novel_title, all_chapters
+        soup = BeautifulSoup(res.text, "html.parser")
+
+        # عنوان الرواية
+        t_tag = soup.find("h1") or soup.find("h2")
+        novel_title = t_tag.text.strip() if t_tag else "رواية"
+
+        chapters_dict = {}
+
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            text = a.text.strip()
+            
+            # فلترة الروابط لاستخراج رقم الفصل الحقيقي فقط
+            match = re.search(r'(?:فصل|chapter|fssl)[^\d]*(\d+)', text, re.I) or re.search(r'(?:فصل|chapter|fssl)[^\d]*(\d+)', href, re.I)
+            
+            if match:
+                ch_num = int(match.group(1))
+                full_url = urljoin(main_url, href)
+                
+                # تجاهل الروابط المكررة أو أزرار التنقل العامة
+                if ch_num not in chapters_dict and not any(bad in text for bad in ["ابدأ", "عرض", "التالي", "السابق"]):
+                    chapters_dict[ch_num] = {
+                        "title": f"الفصل {ch_num}",
+                        "url": full_url,
+                        "num": ch_num
+                    }
+
+        # ترتيب الفصول تصاعدياً من 1 إلى الأخير
+        sorted_chapters = [chapters_dict[k] for k in sorted(chapters_dict.keys())]
+        return novel_title, sorted_chapters
+
     except Exception:
         return "رواية", []
 
-def scrape_chapter_clean(url):
-    """استخراج نص الفصل وتنظيفه تماماً من أي إعلانات أو أزرار"""
+def scrape_chapter_content(url):
+    """استخراج وجرف متن الفصل فقط دون أزرار أو روابط خارجية"""
     try:
         res = requests.get(url, headers=HEADERS, timeout=15)
         if res.status_code != 200:
             return None
 
         soup = BeautifulSoup(res.text, "html.parser")
-        container = soup.find("div", class_=re.compile(r"(entry-content|epcontent|reading-content|chapter-content)", re.I)) or soup.find("article")
+        container = (
+            soup.find("div", class_=re.compile(r"(entry-content|epcontent|reading-content|chapter-content|content)", re.I))
+            or soup.find("article")
+        )
 
         if not container:
             container = soup.find("body")
 
+        # إزالة عناصر الإعلانات والروابط والسكربتات
         for unwanted in container.find_all(["script", "style", "iframe", "ins", "button", "nav", "a"]):
             unwanted.decompose()
 
@@ -145,11 +147,10 @@ def build_epub(novel_title, chapters, output_path):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "أهلاً بك! أرسل لي رابط الصفحة الرئيسية للرواية وسأستخرج قائمة الفصول كاملاً بأسلوب الـ API السريع.\n\n"
-        "💡 **المميزات الجديدة:**\n"
-        "1. استخراج الـ 1100+ فصل كاملة بطلب واحد.\n"
-        "2. لتنزيل أجزاء محددة (مثل أول 50 فصل)، أرسل الرابط متبوعاً بـ النطاق مثلاً:\n"
-        "`https://cenele.com/cont/my-longevity-simulation/ 1 50`"
+        "أهلاً بك! أرسل رابط الرواية وسيتم سحب جميع الفصول وترتيبها تلقائياً من الفصل الأول.\n\n"
+        "💡 **لتحديد نطاق فصول معينة (مثال من 1 إلى 100):**\n"
+        "أرسل الرابط ومعه البداية والنهاية مثل:\n"
+        "`https://cenele.com/cont/my-longevity-simulation/ 1 100`"
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -165,31 +166,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     if not url.startswith("http"):
-        await update.message.reply_text("يرجى إرسال رابط صحيح.")
+        await update.message.reply_text("يرجى إرسال رابط صحيح يبدأ بـ http.")
         return
 
-    status_msg = await update.message.reply_text("⚡ جاري الاتصال بالـ API واستخراج قائمة الفصول كاملة...")
+    status_msg = await update.message.reply_text("🔍 جاري جلب الفهرس وترتيب الفصول تصاعدياً...")
 
-    novel_title, all_chapters = get_chapters_via_wp_api(url)
+    novel_title, all_chapters = get_all_chapters_direct(url)
 
     if not all_chapters:
-        await status_msg.edit_text("❌ لم ينجح الاتصال بالـ API الخاص بالموقع.")
+        await status_msg.edit_text("❌ تعذر العثور على روابط الفصول في الصفحة.")
         return
 
-    # تطبيق تحديد نطاق الفصول إذا أرسله المستخدم
+    # تطبيق تحديد النطاق إن وُجد
     if start_ch and end_ch:
         all_chapters = [c for c in all_chapters if start_ch <= c['num'] <= end_ch]
 
     total = len(all_chapters)
-    await status_msg.edit_text(f"📖 تم جلب {total} فصل متسلسل.\n⏳ جاري التحميل وتجهيز ملف EPUB...")
+    await status_msg.edit_text(f"📖 تم العثور على {total} فصل.\n⏳ جاري تحميل النصوص وتجهيز الـ EPUB...")
 
     collected = []
     for idx, ch in enumerate(all_chapters, start=1):
         if idx % 10 == 0 or idx == total:
             pct = int((idx / total) * 100)
-            await status_msg.edit_text(f"⏳ جاري التحميل: {pct}% ({idx}/{total})\nالفصل: {ch['title']}")
+            await status_msg.edit_text(f"⏳ جاري التحميل: {pct}% ({idx}/{total})\n{ch['title']}")
 
-        content = scrape_chapter_clean(ch['url'])
+        content = scrape_chapter_content(ch['url'])
         if content:
             collected.append((ch['title'], content))
 
@@ -197,7 +198,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text("❌ تعذر استخراج المحتوى.")
         return
 
-    await status_msg.edit_text("📦 جاري ضغط وتنسيق ملف الـ EPUB...")
+    await status_msg.edit_text("📦 جاري ضغط وإنشاء ملف EPUB...")
     
     safe_title = clean_filename(novel_title)
     file_path = f"{safe_title}.epub"
@@ -209,7 +210,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_document(
                 document=file,
                 filename=f"{safe_title}.epub",
-                caption=f"📚 **{novel_title}**\n✅ تم تجميع {len(collected)} فصل بنجاح بأسلوب الـ API!"
+                caption=f"📚 **{novel_title}**\n✅ تم تجميع {len(collected)} فصل بنجاح!"
             )
 
         await status_msg.delete()
@@ -224,6 +225,6 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    print("البوت يعمل بالـ API الخفي...")
+    print("البوت يعمل بشكل مباشر...")
     app.run_polling()
  
