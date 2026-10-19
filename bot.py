@@ -8,8 +8,7 @@ from telegram.ext import (
 )
 from telegram import Update
 
-TOKEN = os.environ.get("
- 8894093871:AAF85mlx2QDVjjAv-oafaYUsoaSGCPPc7NQ", "ضع_رمزك_هنا_مؤقتاً")
+TOKEN = os.environ.get("8894093871:AAFK8wEhpMXf5y-ofZtwqpPCEXC3QM3BkJ4", "ضع_رمزك_هنا_مؤقتاً")
 RIYADH = ZoneInfo("Asia/Riyadh")
 DATA_FILE = "data.json"
 
