@@ -1,7 +1,1 @@
-python-telegram-bot
-requests
-beautifulsoup4
-EbookLib
-Flask
-playwright
-asyncio
+python-telegram-bot[job-queue]
